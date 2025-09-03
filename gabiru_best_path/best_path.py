@@ -37,7 +37,7 @@ class BestPath(Node):
         self.publisher_.publish(msg)
         self.get_logger().info(f"Optimal path published with {len(msg.poses)} poses")
 
-    def validateCenterlineDataHeaders(self,data):
+    def validate_csv_headers(self,data):
         try:
             if data.shape[1] != 4:
                 raise ValueError("CSV file must have exactly 4 columns: x_m, y_m, w_tr_right_m, w_tr_left_m")            
@@ -47,7 +47,7 @@ class BestPath(Node):
     def get_centerline_data(self,centerline_csv):
         # Read track data from CSV, skipping comment lines starting with '#'       
         data = pd.read_csv(centerline_csv, comment='#', header=None)
-        self.validateCenterlineDataHeaders(data)
+        self.validate_csv_headers(data)
         return data.values
     
     def close_track(self,track):
@@ -58,34 +58,43 @@ class BestPath(Node):
         return track
     
     def extract_track_features(self,track):
-        features = {}
-        features["x"] = track[:, 0]
-        features["y"] = track[:, 1]
-        features["twr"] = track[:, 2]
-        features["twl"] = track[:, 3]
-        return features
+        return {
+            ["x"]:track[:, 0],
+            ["y"]:track[:, 1],
+            ["twr"]:track[:, 2],
+            ["twl"]:track[:, 3]
+        }
+       
 
     def get_interpolation_step_length(self,track):
         stepLengths = np.sqrt(np.sum(np.diff(track, axis=0)**2, axis=1))
         return np.concatenate(([0], stepLengths))  # Add starting point
         
+    def stack_xy(self,track):
+        return np.column_stack((track["x"], track["y"]))
+    
+    def compute_cumulative_length(self,track):
+        return np.cumsum(self.get_interpolation_step_length(track))
+    
+    def interpolate_xy(self,cumulative_len, track, step):
+        return interpolate.interp1d(cumulative_len, track, axis=0)(step)
+    
+    def interpolate_scalar(self,cumulative_len, values, steps, kind="cubic"):
+        return interpolate.interp1d(cumulative_len, values, kind=kind)(steps)
     
     def interpolate_track(self,track):
         
-        nseg = 1500
-        pathXY = np.column_stack((track["x"], track["y"]))        
-        cumulativeLen = np.cumsum(self.get_interpolation_step_length(pathXY))
-        finalStepLocs = np.linspace(0, cumulativeLen[-1], nseg)
+        pathXY = self.stack_xy(track)   
+        cumulativeLen = self.compute_cumulative_length(pathXY)
+        finalStepLocs = np.linspace(0, cumulativeLen[-1], 1500)
 
-        # Interpolate x, y, twr, twl
-        finalPathXY = interpolate.interp1d(cumulativeLen, pathXY, axis=0)(finalStepLocs)
-        interpolated_track = {}
-        interpolated_track["xt"] = finalPathXY[:, 0]
-        interpolated_track["yt"] = finalPathXY[:, 1]
-        interpolated_track["twrt"] = interpolate.interp1d(cumulativeLen, track["twr"], kind='cubic')(finalStepLocs)
-        interpolated_track["twlt"] = interpolate.interp1d(cumulativeLen,  track["twl"], kind='cubic')(finalStepLocs)
-
-        return interpolated_track
+        return {
+            "xt":self.interpolate_xy(cumulativeLen,pathXY,finalStepLocs)[:,0],
+            "yt":self.interpolate_xy(cumulativeLen,pathXY,finalStepLocs)[:,1],
+            "twrt":self.interpolate_scalar(cumulativeLen,track["twr"],finalStepLocs),
+            "twlt":self.interpolate_scalar(cumulativeLen,track["twl"],finalStepLocs)
+        }
+        
     
 
     def min_curvature_path_gen(self,csv_file_path, name):
@@ -98,41 +107,26 @@ class BestPath(Node):
 
         track_interpolated = self.interpolate_track(track_data)       
 
-        # Interpolate data to get finer curve with equal distances between segments
-        nseg = 1500
-        pathXY = np.column_stack((track_data["x"], track_data["y"]))
-        stepLengths = np.sqrt(np.sum(np.diff(pathXY, axis=0)**2, axis=1))
-        stepLengths = np.concatenate(([0], stepLengths))  # Add starting point
-        cumulativeLen = np.cumsum(stepLengths)
-        finalStepLocs = np.linspace(0, cumulativeLen[-1], nseg)
-
-        # Interpolate x, y, twr, twl
-        finalPathXY = interpolate.interp1d(cumulativeLen, pathXY, axis=0)(finalStepLocs)
-        xt = finalPathXY[:, 0]
-        yt = finalPathXY[:, 1]
-        twrt = interpolate.interp1d(cumulativeLen, track_data["twr"], kind='cubic')(finalStepLocs)
-        twlt = interpolate.interp1d(cumulativeLen,  track_data["twl"], kind='cubic')(finalStepLocs)
-
-        # Normal direction for each vertex
-        dx = np.gradient(xt)
-        dy = np.gradient(yt)
+        # Normal direction for each vertex.
+        dx = np.gradient(track_interpolated["xt"])
+        dy = np.gradient(track_interpolated["yt"])
         dL = np.hypot(dx, dy)
 
         # Offset curve functions for a specific index
-        def xoff(a, i): return -a * dy[i] / dL[i] + xt[i]
-        def yoff(a, i): return a * dx[i] / dL[i] + yt[i]
+        def xoff(a, i): return -a * dy[i] / dL[i] + track_interpolated["xt"][i]
+        def yoff(a, i): return a * dx[i] / dL[i] + track_interpolated["yt"][i]
 
         # Plot reference line
         plt.figure()
-        plt.plot(xt, yt, 'g', label='Center Line')
+        plt.plot(track_interpolated["xt"], track_interpolated["yt"], 'g', label='Center Line')
         # Offset data
-        offset = np.column_stack((-twrt, twlt))
-        xin = np.zeros_like(xt)
-        yin = np.zeros_like(yt)
-        xout = np.zeros_like(xt)
-        yout = np.zeros_like(yt)
+        offset = np.column_stack((-track_interpolated["twrt"], track_interpolated["twlt"]))
+        xin = np.zeros_like(track_interpolated["xt"])
+        yin = np.zeros_like(track_interpolated["yt"])
+        xout = np.zeros_like(track_interpolated["xt"])
+        yout = np.zeros_like(track_interpolated["yt"])
 
-        for i in range(len(xt)):
+        for i in range(len(track_interpolated["xt"])):
             xin[i] = xoff(offset[i, 0], i)  # Inner offset curve
             yin[i] = yoff(offset[i, 0], i)
             xout[i] = xoff(offset[i, 1], i)  # Outer offset curve
@@ -151,7 +145,7 @@ class BestPath(Node):
         # Form delta matrices
         delx = xout - xin
         dely = yout - yin
-        trackData = np.column_stack((xt, yt, xin, yin, xout, yout))
+        trackData = np.column_stack((track_interpolated["xt"], track_interpolated["yt"], xin, yin, xout, yout))
 
         # Matrix Definition
         n = len(delx)
@@ -201,7 +195,7 @@ class BestPath(Node):
         plt.figure()
         plt.plot(xresMCP, yresMCP, color='r', linewidth=2, label='Optimal Trajectory')
         plt.plot([xin[0], xout[0]], [yin[0], yout[0]], color='b', linewidth=2, label='Starting Line')
-        plt.plot(xt, yt, '--', color='g', label='Center Line')
+        plt.plot(track_interpolated["xt"], track_interpolated["yt"], '--', color='g', label='Center Line')
         plt.plot(xin, yin, color='k', label='Inner Border')
         plt.plot(xout, yout, color='k', label='Outer Border')
         plt.legend()
