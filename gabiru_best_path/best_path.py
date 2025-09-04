@@ -6,7 +6,7 @@ from qpsolvers import solve_qp
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseArray, Pose
-from std_msgs.msg import Header
+from std_msgs.msg import Header,Bool
 
 import importlib.resources as pkg_resources
 import gabiru_best_path
@@ -16,38 +16,86 @@ class BestPath(Node):
     def __init__(self, csv_file_path, name):
         super().__init__('best_path_node')
         self.publisher_ = self.create_publisher(PoseArray, '/optimal_path', 10)
+        self.can_send_best_path_suscription = self.create_subscription(
+            Bool,
+            '/can_recive_best_path',
+            self.can_send_best_path_callback, 
+            10        
+        )
+        self.csv_file_path = csv_file_path
+        self.name = name
+        self.can_send_best_path = False
+        self.sended = False
+        
 
-        # Genera trayectoria óptima
-        trajMCP, _ = self.min_curvature_path_gen(csv_file_path, name)
+    def publish_best_path(self):
+        if self.sended:
+            self.get_logger().info("Best path already sent.")
+            return
 
-        # Convierte a PoseArray
-        msg = PoseArray()
-        msg.header = Header()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "map"
+        if not self.can_send_best_path:
+            self.get_logger().info("Waiting for signal to send best path.")
+        else:
+            # Genera trayectoria óptima
+            trajMCP, _ = self.min_curvature_path_gen(self.csv_file_path, self.name)
 
-        for x, y in trajMCP:
-            pose = Pose()
-            pose.position.x = float(x)
-            pose.position.y = float(y)
-            pose.position.z = 0.0
-            msg.poses.append(pose)
+            # Convierte a PoseArray
+            msg = PoseArray()
+            msg.header = Header()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "map"
 
-        # Publica una sola vez
-        self.publisher_.publish(msg)
-        self.get_logger().info(f"Optimal path published with {len(msg.poses)} poses")
+            for x, y in trajMCP:
+                pose = Pose()
+                pose.position.x = float(x)
+                pose.position.y = float(y)
+                pose.position.z = 0.0
+                msg.poses.append(pose)
 
-    def validate_csv_headers(self,data):
+            # Publica una sola vez
+            self.publisher_.publish(msg)
+            self.get_logger().info(f"Optimal path published with {len(msg.poses)} poses")
+            self.sended = True
+            
+
+    def can_send_best_path_callback(self, msg):
+        self.can_send_best_path = msg.data
+        if self.can_send_best_path:
+            self.get_logger().info("Received signal to send best path.")
+            self.can_send_best_path = True
+        else:
+            self.get_logger().info("Best path sending disabled.")
+
+    def _validate_csv_headers(self,data):
         try:
             if data.shape[1] != 4:
                 raise ValueError("CSV file must have exactly 4 columns: x_m, y_m, w_tr_right_m, w_tr_left_m")            
         except Exception as e:
-            raise Exception(f"Error reading CSV file: {e}")
+            raise Exception(f"Error reading CSV file: {e}")       
 
+
+    def _get_interpolation_step_length(self,track):
+        stepLengths = np.sqrt(np.sum(np.diff(track, axis=0)**2, axis=1))
+        return np.concatenate(([0], stepLengths))  # Add starting point
+        
+    def _stack_xy(self,track):
+        return np.column_stack((track["x"], track["y"]))
+    
+    def _compute_cumulative_length(self,track):
+        return np.cumsum(self._get_interpolation_step_length(track))
+    
+    def _interpolate_xy(self,cumulative_len, track, step):
+        return interpolate.interp1d(cumulative_len, track, axis=0)(step)
+    
+    def _interpolate_scalar(self,cumulative_len, values, steps, kind="cubic"):
+        return interpolate.interp1d(cumulative_len, values, kind=kind)(steps)
+    
+    #Publics
+    
     def get_centerline_data(self,centerline_csv):
         # Read track data from CSV, skipping comment lines starting with '#'       
         data = pd.read_csv(centerline_csv, comment='#', header=None)
-        self.validate_csv_headers(data)
+        self._validate_csv_headers(data)
         return data.values
     
     def close_track(self,track):
@@ -59,40 +107,24 @@ class BestPath(Node):
     
     def extract_track_features(self,track):
         return {
-            ["x"]:track[:, 0],
-            ["y"]:track[:, 1],
-            ["twr"]:track[:, 2],
-            ["twl"]:track[:, 3]
-        }
-       
+            "x":track[:, 0],
+            "y":track[:, 1],
+            "twr":track[:, 2],
+            "twl":track[:, 3]
+        }       
 
-    def get_interpolation_step_length(self,track):
-        stepLengths = np.sqrt(np.sum(np.diff(track, axis=0)**2, axis=1))
-        return np.concatenate(([0], stepLengths))  # Add starting point
-        
-    def stack_xy(self,track):
-        return np.column_stack((track["x"], track["y"]))
-    
-    def compute_cumulative_length(self,track):
-        return np.cumsum(self.get_interpolation_step_length(track))
-    
-    def interpolate_xy(self,cumulative_len, track, step):
-        return interpolate.interp1d(cumulative_len, track, axis=0)(step)
-    
-    def interpolate_scalar(self,cumulative_len, values, steps, kind="cubic"):
-        return interpolate.interp1d(cumulative_len, values, kind=kind)(steps)
     
     def interpolate_track(self,track):
         
-        pathXY = self.stack_xy(track)   
-        cumulativeLen = self.compute_cumulative_length(pathXY)
+        pathXY = self._stack_xy(track)   
+        cumulativeLen = self._compute_cumulative_length(pathXY)
         finalStepLocs = np.linspace(0, cumulativeLen[-1], 1500)
 
         return {
-            "xt":self.interpolate_xy(cumulativeLen,pathXY,finalStepLocs)[:,0],
-            "yt":self.interpolate_xy(cumulativeLen,pathXY,finalStepLocs)[:,1],
-            "twrt":self.interpolate_scalar(cumulativeLen,track["twr"],finalStepLocs),
-            "twlt":self.interpolate_scalar(cumulativeLen,track["twl"],finalStepLocs)
+            "xt":self._interpolate_xy(cumulativeLen,pathXY,finalStepLocs)[:,0],
+            "yt":self._interpolate_xy(cumulativeLen,pathXY,finalStepLocs)[:,1],
+            "twrt":self._interpolate_scalar(cumulativeLen,track["twr"],finalStepLocs),
+            "twlt":self._interpolate_scalar(cumulativeLen,track["twl"],finalStepLocs)
         }
         
     
