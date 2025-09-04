@@ -10,22 +10,40 @@ from std_msgs.msg import Header,Bool
 
 import importlib.resources as pkg_resources
 import gabiru_best_path
+from std_srvs.srv import Trigger
 
 
 class BestPath(Node):
     def __init__(self, csv_file_path, name):
         super().__init__('best_path_node')
+
         self.publisher_ = self.create_publisher(PoseArray, '/optimal_path', 10)
-        self.can_send_best_path_suscription = self.create_subscription(
-            Bool,
-            '/can_recive_best_path',
-            self.can_send_best_path_callback, 
-            10        
-        )
+        self.client = self.create_client(Trigger,'ready_to_recive_path',)
+      
         self.csv_file_path = csv_file_path
         self.name = name
-        self.can_send_best_path = False
+
         self.sended = False
+
+        self.wait_for_segmentation_node()
+
+    def wait_for_segmentation_node(self):
+        while not self.client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Wait for Segmentation Node start...")
+        request = Trigger.Request()
+        future = self.client.call_async(request)
+        future.add_done_callback(self.ready_response_callback)
+    
+    def ready_response_callback(self, future):
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f"PathProcessor listo: {response.message}")
+                self.publish_best_path()
+            else:
+                self.get_logger().error(f"Fallo en la preparación: {response.message}")
+        except Exception as e:
+            self.get_logger().error(f"Error al llamar al servicio: {e}")
         
 
     def publish_best_path(self):
@@ -58,13 +76,7 @@ class BestPath(Node):
             self.sended = True
             
 
-    def can_send_best_path_callback(self, msg):
-        self.can_send_best_path = msg.data
-        if self.can_send_best_path:
-            self.get_logger().info("Received signal to send best path.")
-            self.can_send_best_path = True
-        else:
-            self.get_logger().info("Best path sending disabled.")
+   
 
     def _validate_csv_headers(self,data):
         try:
