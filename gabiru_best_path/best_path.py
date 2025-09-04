@@ -51,29 +51,27 @@ class BestPath(Node):
             self.get_logger().info("Best path already sent.")
             return
 
-        if not self.can_send_best_path:
-            self.get_logger().info("Waiting for signal to send best path.")
-        else:
-            # Genera trayectoria óptima
-            trajMCP, _ = self.min_curvature_path_gen(self.csv_file_path, self.name)
+       
+        # Genera trayectoria óptima
+        trajMCP, _ = self.min_curvature_path_gen(self.csv_file_path, self.name)
 
-            # Convierte a PoseArray
-            msg = PoseArray()
-            msg.header = Header()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = "map"
+        # Convierte a PoseArray
+        msg = PoseArray()
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
 
-            for x, y in trajMCP:
-                pose = Pose()
-                pose.position.x = float(x)
-                pose.position.y = float(y)
-                pose.position.z = 0.0
-                msg.poses.append(pose)
+        for x, y in trajMCP:
+            pose = Pose()
+            pose.position.x = float(x)
+            pose.position.y = float(y)
+            pose.position.z = 0.0
+            msg.poses.append(pose)
 
-            # Publica una sola vez
-            self.publisher_.publish(msg)
-            self.get_logger().info(f"Optimal path published with {len(msg.poses)} poses")
-            self.sended = True
+        # Publica una sola vez
+        self.publisher_.publish(msg)
+        self.get_logger().info(f"Optimal path published with {len(msg.poses)} poses")
+        self.sended = True
             
 
    
